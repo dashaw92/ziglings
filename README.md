@@ -38,21 +38,21 @@ Install a [development build](https://ziglang.org/download/) of the Zig compiler
 
 Verify the installation and build number of `zig` like so:
 
-```bash
+```
 $ zig version
-0.11.0-dev.1844+xxxxxxxxx
+0.11.0-dev.2560+xxxxxxxxx
 ```
 
 Clone this repository with Git:
 
-```bash
+```
 $ git clone https://github.com/ratfactor/ziglings
 $ cd ziglings
 ```
 
 Then run `zig build` and follow the instructions to begin!
 
-```bash
+```
 $ zig build
 ```
 
@@ -80,7 +80,9 @@ about input:
 
 ### Version Changes
 
-Version-0.11.0-dev.1844+xxxxxxxxx
+Version-0.11.0-dev.2560+602029bb2
+* *2023-04-07* zig 0.11.0-dev.2401 - fixes of the new build system - see [#212](https://github.com/ratfactor/ziglings/pull/212)
+* *2023-02-21* zig 0.11.0-dev.2157 - changes in `build system` - new: parallel processing of the build steps
 * *2023-02-21* zig 0.11.0-dev.1711 - changes in `for loops` - new: Multi-Object For-Loops + Struct-of-Arrays
 * *2023-02-12* zig 0.11.0-dev.1638 - changes in `std.Build` cache_root now returns a directory struct
 * *2023-02-04* zig 0.11.0-dev.1568 - changes in `std.Build` (combine `std.build` and `std.build.Builder` into `std.Build`)
@@ -100,29 +102,40 @@ Version-0.11.0-dev.1844+xxxxxxxxx
 It can be handy to check just a single exercise or _start_ from a single
 exercise:
 
-```bash
-zig build 19
-zig build 19_start
+```
+zig build -Dn=19
+zig build -Dn=19 start
 ```
 
 You can also run without checking for correctness:
 
-```bash
-zig build 19_test
+```
+zig build -Dn=19 test
 ```
 
 Or skip the build system entirely and interact directly with the compiler
 if you're into that sort of thing:
 
-```bash
+```
 zig run exercises/001_hello.zig
 ```
 
 Calling all wizards: To prepare an executable for debugging, install it
 to zig-cache/bin with:
 
-```bash
-zig build 19_install
+```
+zig build -Dn=19 install
+```
+
+To get a list of all possible options, run:
+
+```
+zig build -Dn=19 -l
+
+  install                      Install 019_functions2.zig to prefix path
+  uninstall                    Uninstall 019_functions2.zig from prefix path
+  test                         Run 019_functions2.zig without checking output
+  ...
 ```
 
 ## What's Covered
@@ -167,6 +180,7 @@ Core Language
 * [X] Interfaces
 * [X] Working with C
 * [ ] String formatting
+* [X] Bit manipulation
 
 ## Contributing
 
@@ -177,6 +191,6 @@ the learning resource I wished for. There will be tons of room for improvement:
 * Idiomatic usage of Zig
 * Maybe additional exercises?
 
-Please see CONTRIBUTING.md in this repo for the full details.
+Please see [CONTRIBUTING](https://github.com/ratfactor/ziglings/blob/main/CONTRIBUTING.md) in this repo for the full details.
 
 

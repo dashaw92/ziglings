@@ -25,7 +25,7 @@ const Duck = struct {
     location_x: i32 = 0,
     location_y: i32 = 0,
 
-    fn waddle(self: Duck, x: i16, y: i16) void {
+    fn waddle(self: *Duck, x: i16, y: i16) void {
         self.location_x += x;
         self.location_y += y;
     }
@@ -44,7 +44,7 @@ const RubberDuck = struct {
     location_x: i32 = 0,
     location_y: i32 = 0,
 
-    fn waddle(self: RubberDuck, x: i16, y: i16) void {
+    fn waddle(self: *RubberDuck, x: i16, y: i16) void {
         self.location_x += x;
         self.location_y += y;
     }
@@ -70,7 +70,7 @@ const Duct = struct {
     galvanized: bool,
     connection: ?*Duct = null,
 
-    fn connect(self: Duct, other: *Duct) !void {
+    fn connect(self: *Duct, other: *Duct) !void {
         if (self.diameter == other.diameter) {
             self.connection = other;
         } else {
@@ -83,19 +83,19 @@ const DuctError = error{UnmatchedDiameters};
 
 pub fn main() void {
     // This is a real duck!
-    const ducky1 = Duck{
+    var ducky1 = Duck{
         .eggs = 0,
         .loudness = 3,
     };
 
     // This is not a real duck, but it has quack() and waddle()
     // abilities, so it's still a "duck".
-    const ducky2 = RubberDuck{
+    var ducky2 = RubberDuck{
         .in_bath = false,
     };
 
     // This is not even remotely a duck.
-    const ducky3 = Duct{
+    var ducky3 = Duct{
         .diameter = 17,
         .length = 165,
         .galvanized = true,
