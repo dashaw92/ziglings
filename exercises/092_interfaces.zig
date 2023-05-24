@@ -40,7 +40,7 @@
 //
 //   switch (thing) {
 //       .a => |a| special(a),
-//       inline else |t| => normal(t),
+//       inline else => |t| normal(t),
 //   }
 //
 // We can have special handling of some cases and then Zig
@@ -86,7 +86,7 @@ const Insect = union(enum) {
 
     // Thanks to 'inline else', we can think of this print() as
     // being an interface method. Any member of this union with
-    // with a print() method can be treated uniformly by outside
+    // a print() method can be treated uniformly by outside
     // code without needing to know any other details. Cool!
     pub fn print(self: Insect) void {
         switch (self) {
@@ -99,7 +99,7 @@ pub fn main() !void {
     var my_insects = [_]Insect{
         Insect{ .ant = Ant{ .still_alive = true } },
         Insect{ .bee = Bee{ .flowers_visited = 17 } },
-        Insect{ .grasshopper = Grasshopper{ .distance_hopped = 32 }, },
+        Insect{ .grasshopper = Grasshopper{ .distance_hopped = 32 } },
     };
 
     std.debug.print("Daily Insect Report:\n", .{});

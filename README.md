@@ -1,13 +1,14 @@
 # Ziglings
 
-Welcome to Ziglings! This project contains a series of tiny broken programs (and one nasty surprise).
-By fixing them, you'll learn how to read and write [Zig](https://ziglang.org/) code.
+Welcome to Ziglings! This project contains a series of tiny
+broken programs (and one nasty surprise).  By fixing them, you'll
+learn how to read and write [Zig](https://ziglang.org/) code.
 
 ![ziglings](https://user-images.githubusercontent.com/1458409/109398392-c1069500-790a-11eb-8ed4-7d7d74d32666.jpg)
 
-Those broken programs need your help! (You'll also save the planet from
-evil aliens and help some friendly elephants stick together, which is very
-sweet of you.)
+Those broken programs need your help! (You'll also save the
+planet from evil aliens and help some friendly elephants stick
+together, which is very sweet of you.)
 
 This project was directly inspired by the brilliant and fun
 [rustlings](https://github.com/rust-lang/rustlings)
@@ -17,30 +18,34 @@ and the Little LISPer/Little Schemer series of books.
 
 ## Intended Audience
 
-This will probably be difficult if you've _never_ programmed before.
-But no specific programming experience is required. And in particular,
-you are _not_ expected to have any prior experience with "systems programming"
-or a "systems" level language such as C.
+This will probably be difficult if you've _never_ programmed
+before.  But no specific programming experience is required. And
+in particular, you are _not_ expected to have any prior
+experience with "systems programming" or a "systems" level
+language such as C.
 
-Each exercise is self-contained and self-explained. However, you're encouraged
-to also check out these Zig language resources for more detail:
+Each exercise is self-contained and self-explained. However,
+you're encouraged to also check out these Zig language resources
+for more detail:
 
 * https://ziglang.org/learn/
 * https://ziglearn.org/
 * https://ziglang.org/documentation/master/
 
-Also, the [Zig community](https://github.com/ziglang/zig/wiki/Community) is incredibly friendly and helpful!
+Also, the [Zig community](https://github.com/ziglang/zig/wiki/Community)
+is incredibly friendly and helpful!
 
 ## Getting Started
 
-Install a [development build](https://ziglang.org/download/) of the Zig compiler.
-(See the "master" section of the downloads page.)
+Install a [development build](https://ziglang.org/download/) of
+the Zig compiler.  (See the "master" section of the downloads
+page.)
 
 Verify the installation and build number of `zig` like so:
 
 ```
 $ zig version
-0.11.0-dev.2560+xxxxxxxxx
+0.11.0-dev.2704+xxxxxxxxx
 ```
 
 Clone this repository with Git:
@@ -56,31 +61,37 @@ Then run `zig build` and follow the instructions to begin!
 $ zig build
 ```
 
+Note: The output of Ziglings is the unaltered output from the Zig
+compiler. Part of the purpose of Ziglings is to acclimate you to
+reading these.
+
 ## A Note About Versions
 
-The Zig language is under very active development. In order to be current,
-Ziglings tracks **development** builds of the Zig compiler rather than
-versioned **release** builds. The last stable release was `0.10.1`, but Ziglings
-needs a dev build with pre-release version "0.11.0" and a build number at least
-as high as that shown in the example version check above.
+The Zig language is under very active development. In order to be
+current, Ziglings tracks **development** builds of the Zig
+compiler rather than versioned **release** builds. The last
+stable release was `0.10.1`, but Ziglings needs a dev build with
+pre-release version "0.11.0" and a build number at least as high
+as that shown in the example version check above.
 
-It is likely that you'll download a build which is _greater_ than the minimum.
+It is likely that you'll download a build which is _greater_ than
+the minimum.
 
-_(For those who cannot easily update Zig, there are also community-supported
-branches in this repo. At the moment, there's one for v0.8.1. Older version
-branches may or may not have all exercises and/or bugfixes.)_
+_(For those who cannot easily update Zig, there are also
+community-supported branches in this repo. At the moment, there's
+one for v0.8.1. Older version branches may or may not have all
+exercises and/or bugfixes.)_
 
-Once you have a build of the Zig compiler that works with Ziglings, they'll
-continue to work together. But keep in mind that if you update one, you may
-need to also update the other.
+Once you have a build of the Zig compiler that works with
+Ziglings, they'll continue to work together. But keep in mind
+that if you update one, you may need to also update the other.
 
-Also note that the current "stage 1" Zig compiler is very strict
-about input: 
-[no tab characters or Windows CR/LF newlines are allowed](https://github.com/ziglang/zig/issues/544).
 
 ### Version Changes
 
-Version-0.11.0-dev.2560+602029bb2
+Version-0.11.0-dev.2704+83970b6d9
+* *2023-04-30* zig 0.11.0-dev.2704 - use of the new `std.Build.ExecutableOptions.link_libc` field
+* *2023-04-12* zig 0.11.0-dev.2560 - changes in `std.Build` - remove run() and install()
 * *2023-04-07* zig 0.11.0-dev.2401 - fixes of the new build system - see [#212](https://github.com/ratfactor/ziglings/pull/212)
 * *2023-02-21* zig 0.11.0-dev.2157 - changes in `build system` - new: parallel processing of the build steps
 * *2023-02-21* zig 0.11.0-dev.1711 - changes in `for loops` - new: Multi-Object For-Loops + Struct-of-Arrays
@@ -99,8 +110,8 @@ Version-0.11.0-dev.2560+602029bb2
 
 ## Advanced Usage
 
-It can be handy to check just a single exercise or _start_ from a single
-exercise:
+It can be handy to check just a single exercise or _start_ from a
+single exercise:
 
 ```
 zig build -Dn=19
@@ -113,15 +124,15 @@ You can also run without checking for correctness:
 zig build -Dn=19 test
 ```
 
-Or skip the build system entirely and interact directly with the compiler
-if you're into that sort of thing:
+Or skip the build system entirely and interact directly with the
+compiler if you're into that sort of thing:
 
 ```
 zig run exercises/001_hello.zig
 ```
 
-Calling all wizards: To prepare an executable for debugging, install it
-to zig-cache/bin with:
+Calling all wizards: To prepare an executable for debugging,
+install it to zig-cache/bin with:
 
 ```
 zig build -Dn=19 install
@@ -132,19 +143,32 @@ To get a list of all possible options, run:
 ```
 zig build -Dn=19 -l
 
-  install                      Install 019_functions2.zig to prefix path
-  uninstall                    Uninstall 019_functions2.zig from prefix path
-  test                         Run 019_functions2.zig without checking output
+  install          Install 019_functions2.zig to prefix path
+  uninstall        Uninstall 019_functions2.zig from prefix path
+  test             Run 019_functions2.zig without checking output
   ...
 ```
 
 ## What's Covered
 
-I've decide to limit Ziglings to the core language and not
-attempt coverage of the Standard Library. Perhaps you can change
-my mind?
+The primary goal for Ziglings is to cover the core Zig language.
 
-Core Language
+It would be nice to cover the Standard Library as well, but this
+is currently challenging because the stdlib is evolving even
+faster than the core language (and that's saying something!).
+Not only would stdlib coverage change very rapidly, some
+exercises might even cease to be relevant entirely.
+
+Having said that, there are some stdlib features that are
+probably here to stay or are so important to understand that they
+are worth the extra effort to keep current.
+
+Conspicuously absent from Ziglings are a lot of string
+manipulation exercises. This is because Zig itself largely avoids
+dealing with strings. Hopefully there will be an obvious way to
+address this in the future. The Ziglings crew loves strings!
+
+Zig Core Language
 
 * [x] Hello world (main needs to be public)
 * [x] Importing standard library
@@ -176,21 +200,25 @@ Core Language
 * [x] Sentinel termination
 * [x] Quoted identifiers @""
 * [x] Anonymous structs/tuples/lists
-* [ ] Async <--- IN PROGRESS!
+* [ ] Async <--- ironically awaiting upstream Zig updates
 * [X] Interfaces
-* [X] Working with C
-* [ ] String formatting
 * [X] Bit manipulation
+* [X] Working with C
+
+Zig Standard Library
+
+* [X] String formatting
+* [X] Testing
 
 ## Contributing
 
-Contributions are very welcome! I'm writing this to teach myself and to create
-the learning resource I wished for. There will be tons of room for improvement:
+Contributions are very welcome! I'm writing this to teach myself
+and to create the learning resource I wished for. There will be
+tons of room for improvement:
 
 * Wording of explanations
 * Idiomatic usage of Zig
-* Maybe additional exercises?
+* Additional exercises
 
-Please see [CONTRIBUTING](https://github.com/ratfactor/ziglings/blob/main/CONTRIBUTING.md) in this repo for the full details.
-
-
+Please see [CONTRIBUTING](https://github.com/ratfactor/ziglings/blob/main/CONTRIBUTING.md)
+in this repo for the full details.

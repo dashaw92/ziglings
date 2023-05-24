@@ -1,60 +1,69 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("src/compat.zig");
+const ipc = @import("src/ipc.zig");
 const tests = @import("test/tests.zig");
 
 const Build = compat.Build;
+const CompileStep = compat.build.CompileStep;
 const Step = compat.build.Step;
 const Child = std.process.Child;
 
 const assert = std.debug.assert;
+const join = std.fs.path.join;
 const print = std.debug.print;
+
+const Kind = enum {
+    /// Run the artifact as a normal executable.
+    exe,
+    /// Run the artifact as a test.
+    @"test",
+};
 
 pub const Exercise = struct {
     /// main_file must have the format key_name.zig.
-    /// The key will be used as a shorthand to build
-    /// just one example.
+    /// The key will be used as a shorthand to build just one example.
     main_file: []const u8,
 
     /// This is the desired output of the program.
-    /// A program passes if its output ends with this string.
+    /// A program passes if its output, excluding trailing whitespace, is equal
+    /// to this string.
     output: []const u8,
 
     /// This is an optional hint to give if the program does not succeed.
-    hint: []const u8 = "",
+    hint: ?[]const u8 = null,
 
     /// By default, we verify output against stderr.
     /// Set this to true to check stdout instead.
     check_stdout: bool = false,
 
-    /// This exercise makes use of the async feature.
-    /// We need to keep track of this, so we compile without the self hosted compiler
-    @"async": bool = false,
+    /// This exercise makes use of C functions.
+    /// We need to keep track of this, so we compile with libc.
+    link_libc: bool = false,
 
-    /// This exercise makes use of C functions
-    /// We need to keep track of this, so we compile with libc
-    C: bool = false,
+    /// This exercise kind.
+    kind: Kind = .exe,
 
     /// This exercise is not supported by the current Zig compiler.
     skip: bool = false,
 
     /// Returns the name of the main file with .zig stripped.
-    pub fn baseName(self: Exercise) []const u8 {
-        assert(std.mem.endsWith(u8, self.main_file, ".zig"));
-        return self.main_file[0 .. self.main_file.len - 4];
+    pub fn name(self: Exercise) []const u8 {
+        return std.fs.path.stem(self.main_file);
     }
 
     /// Returns the key of the main file, the string before the '_' with
     /// "zero padding" removed.
     /// For example, "001_hello.zig" has the key "1".
     pub fn key(self: Exercise) []const u8 {
-        const end_index = std.mem.indexOfScalar(u8, self.main_file, '_');
-        assert(end_index != null); // main file must be key_description.zig
+        // Main file must be key_description.zig.
+        const end_index = std.mem.indexOfScalar(u8, self.main_file, '_') orelse
+            unreachable;
 
-        // remove zero padding by advancing index past '0's
+        // Remove zero padding by advancing index past '0's.
         var start_index: usize = 0;
         while (self.main_file[start_index] == '0') start_index += 1;
-        return self.main_file[start_index..end_index.?];
+        return self.main_file[start_index..end_index];
     }
 
     /// Returns the exercise key as an integer.
@@ -63,11 +72,613 @@ pub const Exercise = struct {
     }
 };
 
+/// Build mode.
+const Mode = enum {
+    /// Normal build mode: `zig build`
+    normal,
+    /// Named build mode: `zig build -Dn=n`
+    named,
+};
+
+pub const logo =
+    \\         _       _ _
+    \\     ___(_) __ _| (_)_ __   __ _ ___
+    \\    |_  | |/ _' | | | '_ \ / _' / __|
+    \\     / /| | (_| | | | | | | (_| \__ \
+    \\    /___|_|\__, |_|_|_| |_|\__, |___/
+    \\           |___/           |___/
+    \\
+    \\    "Look out! Broken programs below!"
+    \\
+    \\
+;
+
+pub fn build(b: *Build) !void {
+    if (!compat.is_compatible) compat.die();
+    if (!validate_exercises()) std.os.exit(2);
+
+    use_color_escapes = false;
+    if (std.io.getStdErr().supportsAnsiEscapeCodes()) {
+        use_color_escapes = true;
+    } else if (builtin.os.tag == .windows) {
+        const w32 = struct {
+            const WINAPI = std.os.windows.WINAPI;
+            const DWORD = std.os.windows.DWORD;
+            const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+            const STD_ERROR_HANDLE = @bitCast(DWORD, @as(i32, -12));
+            extern "kernel32" fn GetStdHandle(id: DWORD) callconv(WINAPI) ?*anyopaque;
+            extern "kernel32" fn GetConsoleMode(console: ?*anyopaque, out_mode: *DWORD) callconv(WINAPI) u32;
+            extern "kernel32" fn SetConsoleMode(console: ?*anyopaque, mode: DWORD) callconv(WINAPI) u32;
+        };
+        const handle = w32.GetStdHandle(w32.STD_ERROR_HANDLE);
+        var mode: w32.DWORD = 0;
+        if (w32.GetConsoleMode(handle, &mode) != 0) {
+            mode |= w32.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            use_color_escapes = w32.SetConsoleMode(handle, mode) != 0;
+        }
+    }
+
+    if (use_color_escapes) {
+        red_text = "\x1b[31m";
+        green_text = "\x1b[32m";
+        bold_text = "\x1b[1m";
+        reset_text = "\x1b[0m";
+    }
+
+    // Remove the standard install and uninstall steps.
+    b.top_level_steps = .{};
+
+    const healed = b.option(bool, "healed", "Run exercises from patches/healed") orelse
+        false;
+    const override_healed_path = b.option([]const u8, "healed-path", "Override healed path");
+    const exno: ?usize = b.option(usize, "n", "Select exercise");
+
+    const sep = std.fs.path.sep_str;
+    const healed_path = if (override_healed_path) |path|
+        path
+    else
+        "patches" ++ sep ++ "healed";
+    const work_path = if (healed) healed_path else "exercises";
+
+    const header_step = PrintStep.create(b, logo);
+
+    if (exno) |n| {
+        // Named build mode: verifies a single exercise.
+        if (n == 0 or n > exercises.len - 1) {
+            print("unknown exercise number: {}\n", .{n});
+            std.os.exit(2);
+        }
+        const ex = exercises[n - 1];
+
+        const zigling_step = b.step(
+            "zigling",
+            b.fmt("Check the solution of {s}", .{ex.main_file}),
+        );
+        b.default_step = zigling_step;
+        zigling_step.dependOn(&header_step.step);
+
+        const verify_step = ZiglingStep.create(b, ex, work_path, .named);
+        verify_step.step.dependOn(&header_step.step);
+
+        zigling_step.dependOn(&verify_step.step);
+
+        return;
+    }
+
+    // Normal build mode: verifies all exercises according to the recommended
+    // order.
+    const ziglings_step = b.step("ziglings", "Check all ziglings");
+    b.default_step = ziglings_step;
+
+    var prev_step = &header_step.step;
+    for (exercises) |ex| {
+        const verify_stepn = ZiglingStep.create(b, ex, work_path, .normal);
+        verify_stepn.step.dependOn(prev_step);
+
+        prev_step = &verify_stepn.step;
+    }
+    ziglings_step.dependOn(prev_step);
+
+    const test_step = b.step("test", "Run all the tests");
+    test_step.dependOn(tests.addCliTests(b, &exercises));
+}
+
+var use_color_escapes = false;
+var red_text: []const u8 = "";
+var green_text: []const u8 = "";
+var bold_text: []const u8 = "";
+var reset_text: []const u8 = "";
+
+const ZiglingStep = struct {
+    step: Step,
+    exercise: Exercise,
+    work_path: []const u8,
+    mode: Mode,
+
+    is_testing: bool = false,
+    result_messages: []const u8 = "",
+    result_error_bundle: std.zig.ErrorBundle = std.zig.ErrorBundle.empty,
+
+    pub fn create(
+        b: *Build,
+        exercise: Exercise,
+        work_path: []const u8,
+        mode: Mode,
+    ) *ZiglingStep {
+        const self = b.allocator.create(ZiglingStep) catch @panic("OOM");
+        self.* = .{
+            .step = Step.init(.{
+                .id = .custom,
+                .name = exercise.main_file,
+                .owner = b,
+                .makeFn = make,
+            }),
+            .exercise = exercise,
+            .work_path = work_path,
+            .mode = mode,
+        };
+        return self;
+    }
+
+    fn make(step: *Step, prog_node: *std.Progress.Node) !void {
+        // NOTE: Using exit code 2 will prevent the Zig compiler to print the message:
+        // "error: the following build command failed with exit code 1:..."
+        const self = @fieldParentPtr(ZiglingStep, "step", step);
+
+        if (self.exercise.skip) {
+            print("Skipping {s}\n\n", .{self.exercise.main_file});
+
+            return;
+        }
+
+        const exe_path = self.compile(prog_node) catch {
+            if (self.exercise.hint) |hint|
+                print("\n{s}Ziglings hint: {s}{s}", .{ bold_text, hint, reset_text });
+
+            self.help();
+            std.os.exit(2);
+        };
+
+        self.run(exe_path, prog_node) catch {
+            if (self.exercise.hint) |hint|
+                print("\n{s}Ziglings hint: {s}{s}", .{ bold_text, hint, reset_text });
+
+            self.help();
+            std.os.exit(2);
+        };
+    }
+
+    fn run(self: *ZiglingStep, exe_path: []const u8, _: *std.Progress.Node) !void {
+        resetLine();
+        print("Checking {s}...\n", .{self.exercise.main_file});
+
+        const b = self.step.owner;
+
+        // Allow up to 1 MB of stdout capture.
+        const max_output_bytes = 1 * 1024 * 1024;
+
+        var result = Child.exec(.{
+            .allocator = b.allocator,
+            .argv = &.{exe_path},
+            .cwd = b.build_root.path.?,
+            .cwd_dir = b.build_root.handle,
+            .max_output_bytes = max_output_bytes,
+        }) catch |err| {
+            print("{s}Unable to spawn {s}: {s}{s}\n", .{
+                red_text, exe_path, @errorName(err), reset_text,
+            });
+            return err;
+        };
+
+        switch (self.exercise.kind) {
+            .exe => return self.check_output(result),
+            .@"test" => return self.check_test(result),
+        }
+    }
+
+    fn check_output(self: *ZiglingStep, result: Child.ExecResult) !void {
+        const b = self.step.owner;
+
+        // Make sure it exited cleanly.
+        switch (result.term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    print("{s}{s} exited with error code {d} (expected {d}){s}\n", .{
+                        red_text, self.exercise.main_file, code, 0, reset_text,
+                    });
+                    return error.BadExitCode;
+                }
+            },
+            else => {
+                print("{s}{s} terminated unexpectedly{s}\n", .{
+                    red_text, self.exercise.main_file, reset_text,
+                });
+                return error.UnexpectedTermination;
+            },
+        }
+
+        const raw_output = if (self.exercise.check_stdout)
+            result.stdout
+        else
+            result.stderr;
+
+        // Validate the output.
+        // NOTE: exercise.output can never contain a CR character.
+        // See https://ziglang.org/documentation/master/#Source-Encoding.
+        const output = try trimLines(b.allocator, raw_output);
+        const exercise_output = self.exercise.output;
+        if (!std.mem.eql(u8, output, self.exercise.output)) {
+            const red = red_text;
+            const reset = reset_text;
+
+            print(
+                \\
+                \\{s}========= expected this output: =========={s}
+                \\{s}
+                \\{s}========= but found: ====================={s}
+                \\{s}
+                \\{s}=========================================={s}
+                \\
+            , .{ red, reset, exercise_output, red, reset, output, red, reset });
+            return error.InvalidOutput;
+        }
+
+        print("{s}PASSED:\n{s}{s}\n\n", .{ green_text, output, reset_text });
+    }
+
+    fn check_test(self: *ZiglingStep, result: Child.ExecResult) !void {
+        switch (result.term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    // The test failed.
+                    print("{s}{s}{s}\n", .{
+                        red_text, result.stderr, reset_text,
+                    });
+
+                    return error.TestFailed;
+                }
+            },
+            else => {
+                print("{s}{s} terminated unexpectedly{s}\n", .{
+                    red_text, self.exercise.main_file, reset_text,
+                });
+
+                return error.UnexpectedTermination;
+            },
+        }
+
+        print("{s}PASSED{s}\n\n", .{ green_text, reset_text });
+    }
+
+    fn compile(self: *ZiglingStep, prog_node: *std.Progress.Node) ![]const u8 {
+        print("Compiling {s}...\n", .{self.exercise.main_file});
+
+        const b = self.step.owner;
+        const exercise_path = self.exercise.main_file;
+        const path = join(b.allocator, &.{ self.work_path, exercise_path }) catch
+            @panic("OOM");
+
+        var zig_args = std.ArrayList([]const u8).init(b.allocator);
+        defer zig_args.deinit();
+
+        zig_args.append(b.zig_exe) catch @panic("OOM");
+
+        const cmd = switch (self.exercise.kind) {
+            .exe => "build-exe",
+            .@"test" => "test",
+        };
+        zig_args.append(cmd) catch @panic("OOM");
+
+        // Enable C support for exercises that use C functions.
+        if (self.exercise.link_libc) {
+            zig_args.append("-lc") catch @panic("OOM");
+        }
+
+        zig_args.append(b.pathFromRoot(path)) catch @panic("OOM");
+
+        zig_args.append("--cache-dir") catch @panic("OOM");
+        zig_args.append(b.pathFromRoot(b.cache_root.path.?)) catch @panic("OOM");
+
+        zig_args.append("--listen=-") catch @panic("OOM");
+
+        const argv = zig_args.items;
+        var code: u8 = undefined;
+        const exe_path = self.eval(argv, &code, prog_node) catch |err| {
+            self.printErrors();
+
+            switch (err) {
+                error.FileNotFound => {
+                    print("{s}{s}: Unable to spawn the following command: file not found{s}\n", .{
+                        red_text, self.exercise.main_file, reset_text,
+                    });
+                    dumpArgs(argv);
+                },
+                error.ExitCodeFailure => {
+                    print("{s}{s}: The following command exited with error code {}:{s}\n", .{
+                        red_text, self.exercise.main_file, code, reset_text,
+                    });
+                    dumpArgs(argv);
+                },
+                error.ProcessTerminated => {
+                    print("{s}{s}: The following command terminated unexpectedly:{s}\n", .{
+                        red_text, self.exercise.main_file, reset_text,
+                    });
+                    dumpArgs(argv);
+                },
+                error.ZigIPCError => {
+                    // Commenting this out for now. It always shows up when compilation fails.
+                    //print("{s}{s}: The following command failed to communicate the compilation result:{s}\n", .{
+                    //    red_text, self.exercise.main_file, reset_text,
+                    //});
+                    //dumpArgs(argv);
+                },
+                else => {
+                    print("{s}{s}: Unexpected error: {s}{s}\n", .{
+                        red_text, self.exercise.main_file, @errorName(err), reset_text,
+                    });
+                    dumpArgs(argv);
+                },
+            }
+
+            return err;
+        };
+        self.printErrors();
+
+        return exe_path;
+    }
+
+    // Code adapted from `std.Build.execAllowFail and `std.Build.Step.evalZigProcess`.
+    pub fn eval(
+        self: *ZiglingStep,
+        argv: []const []const u8,
+        out_code: *u8,
+        prog_node: *std.Progress.Node,
+    ) ![]const u8 {
+        assert(argv.len != 0);
+        const b = self.step.owner;
+        const allocator = b.allocator;
+
+        var child = Child.init(argv, allocator);
+        child.env_map = b.env_map;
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        try child.spawn();
+
+        var poller = std.io.poll(allocator, enum { stdout, stderr }, .{
+            .stdout = child.stdout.?,
+            .stderr = child.stderr.?,
+        });
+        defer poller.deinit();
+
+        try ipc.sendMessage(child.stdin.?, .update);
+        try ipc.sendMessage(child.stdin.?, .exit);
+
+        const Header = std.zig.Server.Message.Header;
+        var result: ?[]const u8 = null;
+
+        var node_name: std.ArrayListUnmanaged(u8) = .{};
+        defer node_name.deinit(allocator);
+        var sub_prog_node = prog_node.start("", 0);
+        defer sub_prog_node.end();
+
+        const stdout = poller.fifo(.stdout);
+
+        poll: while (true) {
+            while (stdout.readableLength() < @sizeOf(Header)) {
+                if (!(try poller.poll())) break :poll;
+            }
+            const header = stdout.reader().readStruct(Header) catch unreachable;
+            while (stdout.readableLength() < header.bytes_len) {
+                if (!(try poller.poll())) break :poll;
+            }
+            const body = stdout.readableSliceOfLen(header.bytes_len);
+
+            switch (header.tag) {
+                .zig_version => {
+                    if (!std.mem.eql(u8, builtin.zig_version_string, body))
+                        return error.ZigVersionMismatch;
+                },
+                .error_bundle => {
+                    self.result_error_bundle = try ipc.parseErrorBundle(allocator, body);
+                },
+                .progress => {
+                    node_name.clearRetainingCapacity();
+                    try node_name.appendSlice(allocator, body);
+                    sub_prog_node.setName(node_name.items);
+                },
+                .emit_bin_path => {
+                    const emit_bin = try ipc.parseEmitBinPath(allocator, body);
+                    result = emit_bin.path;
+                },
+                else => {}, // ignore other messages
+            }
+
+            stdout.discard(body.len);
+        }
+
+        const stderr = poller.fifo(.stderr);
+        if (stderr.readableLength() > 0) {
+            self.result_messages = try stderr.toOwnedSlice();
+        }
+
+        // Send EOF to stdin.
+        child.stdin.?.close();
+        child.stdin = null;
+
+        // Keep the errors compatible with std.Build.execAllowFail.
+        const term = try child.wait();
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    out_code.* = @truncate(u8, code);
+
+                    return error.ExitCodeFailure;
+                }
+            },
+            .Signal, .Stopped, .Unknown => |code| {
+                out_code.* = @truncate(u8, code);
+
+                return error.ProcessTerminated;
+            },
+        }
+
+        if (self.is_testing) {
+            return "ok";
+        }
+        return result orelse return error.ZigIPCError;
+    }
+
+    fn help(self: *ZiglingStep) void {
+        const b = self.step.owner;
+        const key = self.exercise.key();
+        const path = self.exercise.main_file;
+
+        const cmd = switch (self.mode) {
+            .normal => "zig build",
+            .named => b.fmt("zig build -Dn={s}", .{key}),
+        };
+
+        print("\n{s}Edit exercises/{s} and run '{s}' again.{s}\n", .{
+            red_text, path, cmd, reset_text,
+        });
+    }
+
+    fn printErrors(self: *ZiglingStep) void {
+        resetLine();
+
+        // Print the additional log and verbose messages.
+        // TODO: use colors?
+        if (self.result_messages.len > 0) print("{s}", .{self.result_messages});
+
+        // Print the compiler errors.
+        // TODO: use the same ttyconf from the builder.
+        const ttyconf: std.debug.TTY.Config = if (use_color_escapes)
+            .escape_codes
+        else
+            .no_color;
+        if (self.result_error_bundle.errorMessageCount() > 0) {
+            self.result_error_bundle.renderToStdErr(.{ .ttyconf = ttyconf });
+        }
+    }
+};
+
+fn dumpArgs(args: []const []const u8) void {
+    for (args) |arg| print("{s} ", .{arg});
+    print("\n", .{});
+}
+
+/// Clears the entire line and move the cursor to column zero.
+/// Used for clearing the compiler and build_runner progress messages.
+fn resetLine() void {
+    if (use_color_escapes) print("{s}", .{"\x1b[2K\r"});
+}
+
+/// Removes trailing whitespace for each line in buf, also ensuring that there
+/// are no trailing LF characters at the end.
+pub fn trimLines(allocator: std.mem.Allocator, buf: []const u8) ![]const u8 {
+    var list = try std.ArrayList(u8).initCapacity(allocator, buf.len);
+
+    var iter = std.mem.split(u8, buf, " \n");
+    while (iter.next()) |line| {
+        // TODO: trimming CR characters is probably not necessary.
+        const data = std.mem.trimRight(u8, line, " \r");
+        try list.appendSlice(data);
+        try list.append('\n');
+    }
+
+    const result = try list.toOwnedSlice(); // TODO: probably not necessary
+
+    // Remove the trailing LF character, that is always present in the exercise
+    // output.
+    return std.mem.trimRight(u8, result, "\n");
+}
+
+/// Prints a message to stderr.
+const PrintStep = struct {
+    step: Step,
+    message: []const u8,
+
+    pub fn create(owner: *Build, message: []const u8) *PrintStep {
+        const self = owner.allocator.create(PrintStep) catch @panic("OOM");
+        self.* = .{
+            .step = Step.init(.{
+                .id = .custom,
+                .name = "print",
+                .owner = owner,
+                .makeFn = make,
+            }),
+            .message = message,
+        };
+
+        return self;
+    }
+
+    fn make(step: *Step, _: *std.Progress.Node) !void {
+        const self = @fieldParentPtr(PrintStep, "step", step);
+
+        print("{s}", .{self.message});
+    }
+};
+
+/// Checks that each exercise number, excluding the last, forms the sequence
+/// `[1, exercise.len)`.
+///
+/// Additionally check that the output field lines doesn't have trailing whitespace.
+fn validate_exercises() bool {
+    // Don't use the "multi-object for loop" syntax, in order to avoid a syntax
+    // error with old Zig compilers.
+    var i: usize = 0;
+    for (exercises[0..]) |ex| {
+        const exno = ex.number();
+        const last = 999;
+        i += 1;
+
+        if (exno != i and exno != last) {
+            print("exercise {s} has an incorrect number: expected {}, got {s}\n", .{
+                ex.main_file, i, ex.key(),
+            });
+
+            return false;
+        }
+
+        var iter = std.mem.split(u8, ex.output, "\n");
+        while (iter.next()) |line| {
+            const output = std.mem.trimRight(u8, line, " \r");
+            if (output.len != line.len) {
+                print("exercise {s} output field lines have trailing whitespace\n", .{
+                    ex.main_file,
+                });
+
+                return false;
+            }
+        }
+
+        if (!std.mem.endsWith(u8, ex.main_file, ".zig")) {
+            print("exercise {s} is not a zig source file\n", .{ex.main_file});
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
 const exercises = [_]Exercise{
     .{
         .main_file = "001_hello.zig",
         .output = "Hello world!",
-        .hint = "DON'T PANIC!\nRead the error above.\nSee how it has something to do with 'main'?\nOpen up the source file as noted and read the comments.\nYou can do this!",
+        .hint =
+        \\DON'T PANIC!
+        \\Read the compiler messages above. (Something about 'main'?)
+        \\Open up the source file as noted below and read the comments.
+        \\
+        \\(Hints like these will occasionally show up, but for the
+        \\most part, you'll be taking directions from the Zig
+        \\compiler itself.)
+        \\
+        ,
     },
     .{
         .main_file = "002_std.zig",
@@ -95,7 +706,11 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "007_strings2.zig",
-        .output = "Ziggy played guitar\nJamming good with Andrew Kelley\nAnd the Spiders from Mars",
+        .output =
+        \\Ziggy played guitar
+        \\Jamming good with Andrew Kelley
+        \\And the Spiders from Mars
+        ,
         .hint = "Please fix the lyrics!",
     },
     .{
@@ -226,7 +841,13 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "036_enums2.zig",
-        .output = "<p>\n  <span style=\"color: #ff0000\">Red</span>\n  <span style=\"color: #00ff00\">Green</span>\n  <span style=\"color: #0000ff\">Blue</span>\n</p>",
+        .output =
+        \\<p>
+        \\  <span style="color: #ff0000">Red</span>
+        \\  <span style="color: #00ff00">Green</span>
+        \\  <span style="color: #0000ff">Blue</span>
+        \\</p>
+        ,
         .hint = "I'm feeling blue about this.",
     },
     .{
@@ -235,7 +856,10 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "038_structs2.zig",
-        .output = "Character 1 - G:20 H:100 XP:10\nCharacter 2 - G:10 H:100 XP:20",
+        .output =
+        \\Character 1 - G:20 H:100 XP:10
+        \\Character 2 - G:10 H:100 XP:20
+        ,
     },
     .{
         .main_file = "039_pointers.zig",
@@ -256,7 +880,10 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "043_pointers5.zig",
-        .output = "Wizard (G:10 H:100 XP:20)\n  Mentor: Wizard (G:10000 H:100 XP:2340)",
+        .output =
+        \\Wizard (G:10 H:100 XP:20)
+        \\  Mentor: Wizard (G:10000 H:100 XP:2340)
+        ,
     },
     .{
         .main_file = "044_quiz5.zig",
@@ -297,7 +924,10 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "052_slices.zig",
-        .output = "Hand1: A 4 K 8 \nHand2: 5 2 Q J",
+        .output =
+        \\Hand1: A 4 K 8
+        \\Hand2: 5 2 Q J
+        ,
     },
     .{
         .main_file = "053_slices2.zig",
@@ -364,7 +994,11 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "068_comptime3.zig",
-        .output = "Minnow (1:32, 4 x 2)\nShark (1:16, 8 x 5)\nWhale (1:1, 143 x 95)\n",
+        .output =
+        \\Minnow (1:32, 4 x 2)
+        \\Shark (1:16, 8 x 5)
+        \\Whale (1:1, 143 x 95)
+        ,
     },
     .{
         .main_file = "069_comptime4.zig",
@@ -372,7 +1006,9 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "070_comptime5.zig",
-        .output = "\"Quack.\" ducky1: true, \"Squeek!\" ducky2: true, ducky3: false",
+        .output =
+        \\"Quack." ducky1: true, "Squeek!" ducky2: true, ducky3: false
+        ,
         .hint = "Have you kept the wizard hat on?",
     },
     .{
@@ -423,7 +1059,9 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "082_anonymous_structs3.zig",
-        .output = "\"0\"(bool):true \"1\"(bool):false \"2\"(i32):42 \"3\"(f32):3.14159202e+00",
+        .output =
+        \\"0"(bool):true "1"(bool):false "2"(i32):42 "3"(f32):3.14159202e+00
+        ,
         .hint = "This one is a challenge! But you have everything you need.",
     },
     .{
@@ -437,68 +1075,65 @@ const exercises = [_]Exercise{
         .main_file = "084_async.zig",
         .output = "foo() A",
         .hint = "Read the facts. Use the facts.",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "085_async2.zig",
         .output = "Hello async!",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "086_async3.zig",
         .output = "5 4 3 2 1",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "087_async4.zig",
         .output = "1 2 3 4 5",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "088_async5.zig",
         .output = "Example Title.",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "089_async6.zig",
         .output = ".com: Example Title, .org: Example Title.",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "090_async7.zig",
         .output = "beef? BEEF!",
-        .@"async" = true,
         .skip = true,
     },
     .{
         .main_file = "091_async8.zig",
         .output = "ABCDEF",
-        .@"async" = true,
         .skip = true,
     },
 
     .{
         .main_file = "092_interfaces.zig",
-        .output = "Daily Insect Report:\nAnt is alive.\nBee visited 17 flowers.\nGrasshopper hopped 32 meters.",
+        .output =
+        \\Daily Insect Report:
+        \\Ant is alive.
+        \\Bee visited 17 flowers.
+        \\Grasshopper hopped 32 meters.
+        ,
     },
     .{
         .main_file = "093_hello_c.zig",
         .output = "Hello C from Zig! - C result is 17 chars written.",
-        .C = true,
+        .link_libc = true,
     },
     .{
         .main_file = "094_c_math.zig",
         .output = "The normalized angle of 765.2 degrees is 45.2 degrees.",
-        .C = true,
+        .link_libc = true,
     },
     .{
-        .main_file = "095_for_loops.zig",
+        .main_file = "095_for3.zig",
         .output = "1 2 4 7 8 11 13 14 16 17 19",
     },
     .{
@@ -514,559 +1149,66 @@ const exercises = [_]Exercise{
         .output = "Is this a pangram? true!",
     },
     .{
+        .main_file = "099_formatting.zig",
+        .output =
+        \\
+        \\ X |  1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+        \\---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+        \\ 1 |  1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+        \\
+        \\ 2 |  2   4   6   8  10  12  14  16  18  20  22  24  26  28  30
+        \\
+        \\ 3 |  3   6   9  12  15  18  21  24  27  30  33  36  39  42  45
+        \\
+        \\ 4 |  4   8  12  16  20  24  28  32  36  40  44  48  52  56  60
+        \\
+        \\ 5 |  5  10  15  20  25  30  35  40  45  50  55  60  65  70  75
+        \\
+        \\ 6 |  6  12  18  24  30  36  42  48  54  60  66  72  78  84  90
+        \\
+        \\ 7 |  7  14  21  28  35  42  49  56  63  70  77  84  91  98 105
+        \\
+        \\ 8 |  8  16  24  32  40  48  56  64  72  80  88  96 104 112 120
+        \\
+        \\ 9 |  9  18  27  36  45  54  63  72  81  90  99 108 117 126 135
+        \\
+        \\10 | 10  20  30  40  50  60  70  80  90 100 110 120 130 140 150
+        \\
+        \\11 | 11  22  33  44  55  66  77  88  99 110 121 132 143 154 165
+        \\
+        \\12 | 12  24  36  48  60  72  84  96 108 120 132 144 156 168 180
+        \\
+        \\13 | 13  26  39  52  65  78  91 104 117 130 143 156 169 182 195
+        \\
+        \\14 | 14  28  42  56  70  84  98 112 126 140 154 168 182 196 210
+        \\
+        \\15 | 15  30  45  60  75  90 105 120 135 150 165 180 195 210 225
+        ,
+    },
+    .{
+        .main_file = "100_for4.zig",
+        .output = "Arrays match!",
+    },
+    .{
+        .main_file = "101_for5.zig",
+        .output =
+        \\1. Wizard (Gold: 25, XP: 40)
+        \\2. Bard (Gold: 11, XP: 17)
+        \\3. Bard (Gold: 5, XP: 55)
+        \\4. Warrior (Gold: 7392, XP: 21)
+        ,
+    },
+    .{
+        .main_file = "102_testing.zig",
+        .output = "",
+        .kind = .@"test",
+    },
+    .{
         .main_file = "999_the_end.zig",
-        .output = "\nThis is the end for now!\nWe hope you had fun and were able to learn a lot, so visit us again when the next exercises are available.",
+        .output =
+        \\
+        \\This is the end for now!
+        \\We hope you had fun and were able to learn a lot, so visit us again when the next exercises are available.
+        ,
     },
 };
-
-pub fn build(b: *Build) !void {
-    if (!compat.is_compatible) compat.die();
-    if (!validate_exercises()) std.os.exit(1);
-
-    use_color_escapes = false;
-    if (std.io.getStdErr().supportsAnsiEscapeCodes()) {
-        use_color_escapes = true;
-    } else if (builtin.os.tag == .windows) {
-        const w32 = struct {
-            const WINAPI = std.os.windows.WINAPI;
-            const DWORD = std.os.windows.DWORD;
-            const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
-            const STD_ERROR_HANDLE = @bitCast(DWORD, @as(i32, -12));
-            extern "kernel32" fn GetStdHandle(id: DWORD) callconv(WINAPI) ?*anyopaque;
-            extern "kernel32" fn GetConsoleMode(console: ?*anyopaque, out_mode: *DWORD) callconv(WINAPI) u32;
-            extern "kernel32" fn SetConsoleMode(console: ?*anyopaque, mode: DWORD) callconv(WINAPI) u32;
-        };
-        const handle = w32.GetStdHandle(w32.STD_ERROR_HANDLE);
-        var mode: w32.DWORD = 0;
-        if (w32.GetConsoleMode(handle, &mode) != 0) {
-            mode |= w32.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            use_color_escapes = w32.SetConsoleMode(handle, mode) != 0;
-        }
-    }
-
-    if (use_color_escapes) {
-        red_text = "\x1b[31m";
-        green_text = "\x1b[32m";
-        bold_text = "\x1b[1m";
-        reset_text = "\x1b[0m";
-    }
-
-    const logo =
-        \\
-        \\         _       _ _
-        \\     ___(_) __ _| (_)_ __   __ _ ___
-        \\    |_  | |/ _' | | | '_ \ / _' / __|
-        \\     / /| | (_| | | | | | | (_| \__ \
-        \\    /___|_|\__, |_|_|_| |_|\__, |___/
-        \\           |___/           |___/
-        \\
-        \\
-    ;
-
-    const use_healed = b.option(bool, "healed", "Run exercises from patches/healed") orelse false;
-    const exno: ?usize = b.option(usize, "n", "Select exercise");
-
-    const header_step = PrintStep.create(b, logo);
-
-    if (exno) |n| {
-        if (n == 0 or n > exercises.len - 1) {
-            print("unknown exercise number: {}\n", .{n});
-            std.os.exit(1);
-        }
-
-        const ex = exercises[n - 1];
-        const base_name = ex.baseName();
-        const file_path = std.fs.path.join(b.allocator, &[_][]const u8{
-            if (use_healed) "patches/healed" else "exercises", ex.main_file,
-        }) catch unreachable;
-
-        const build_step = b.addExecutable(.{ .name = base_name, .root_source_file = .{ .path = file_path } });
-        if (ex.C) {
-            build_step.linkLibC();
-        }
-        b.installArtifact(build_step);
-
-        const run_step = b.addRunArtifact(build_step);
-
-        const test_step = b.step("test", b.fmt("Run {s} without checking output", .{ex.main_file}));
-        if (ex.skip) {
-            const skip_step = SkipStep.create(b, ex);
-            test_step.dependOn(&skip_step.step);
-        } else {
-            test_step.dependOn(&run_step.step);
-        }
-
-        const install_step = b.step("install", b.fmt("Install {s} to prefix path", .{ex.main_file}));
-        install_step.dependOn(b.getInstallStep());
-
-        const uninstall_step = b.step("uninstall", b.fmt("Uninstall {s} from prefix path", .{ex.main_file}));
-        uninstall_step.dependOn(b.getUninstallStep());
-
-        const verify_step = ZiglingStep.create(b, ex, use_healed);
-
-        const zigling_step = b.step("zigling", b.fmt("Check the solution of {s}", .{ex.main_file}));
-        zigling_step.dependOn(&verify_step.step);
-        b.default_step = zigling_step;
-
-        const start_step = b.step("start", b.fmt("Check all solutions starting at {s}", .{ex.main_file}));
-
-        var prev_step = verify_step;
-        for (exercises) |exn| {
-            const nth = exn.number();
-            if (nth > n) {
-                const verify_stepn = ZiglingStep.create(b, exn, use_healed);
-                verify_stepn.step.dependOn(&prev_step.step);
-
-                prev_step = verify_stepn;
-            }
-        }
-        start_step.dependOn(&prev_step.step);
-
-        return;
-    } else if (use_healed and false) {
-        const test_step = b.step("test", "Test the healed exercises");
-        b.default_step = test_step;
-
-        for (exercises) |ex| {
-            const base_name = ex.baseName();
-            const file_path = std.fs.path.join(b.allocator, &[_][]const u8{
-                "patches/healed", ex.main_file,
-            }) catch unreachable;
-
-            const build_step = b.addExecutable(.{ .name = base_name, .root_source_file = .{ .path = file_path } });
-            if (ex.C) {
-                build_step.linkLibC();
-            }
-            b.installArtifact(build_step);
-
-            const run_step = b.addRunArtifact(build_step);
-            if (ex.skip) {
-                const skip_step = SkipStep.create(b, ex);
-                test_step.dependOn(&skip_step.step);
-            } else {
-                test_step.dependOn(&run_step.step);
-            }
-        }
-
-        return;
-    }
-
-    const ziglings_step = b.step("ziglings", "Check all ziglings");
-    b.default_step = ziglings_step;
-
-    // Don't use the "multi-object for loop" syntax, in order to avoid a syntax
-    // error with old Zig compilers.
-    var prev_step = &header_step.step;
-    for (exercises) |ex| {
-        const base_name = ex.baseName();
-        const file_path = std.fs.path.join(b.allocator, &[_][]const u8{
-            "exercises", ex.main_file,
-        }) catch unreachable;
-
-        const build_step = b.addExecutable(.{ .name = base_name, .root_source_file = .{ .path = file_path } });
-        b.installArtifact(build_step);
-
-        const verify_stepn = ZiglingStep.create(b, ex, use_healed);
-        verify_stepn.step.dependOn(prev_step);
-
-        prev_step = &verify_stepn.step;
-    }
-    ziglings_step.dependOn(prev_step);
-
-    const test_step = b.step("test", "Run all the tests");
-    test_step.dependOn(tests.addCliTests(b, &exercises));
-}
-
-var use_color_escapes = false;
-var red_text: []const u8 = "";
-var green_text: []const u8 = "";
-var bold_text: []const u8 = "";
-var reset_text: []const u8 = "";
-
-const ZiglingStep = struct {
-    step: Step,
-    exercise: Exercise,
-    builder: *Build,
-    use_healed: bool,
-
-    pub fn create(builder: *Build, exercise: Exercise, use_healed: bool) *@This() {
-        const self = builder.allocator.create(@This()) catch unreachable;
-        self.* = .{
-            .step = Step.init(Step.Options{ .id = .custom, .name = exercise.main_file, .owner = builder, .makeFn = make }),
-            .exercise = exercise,
-            .builder = builder,
-            .use_healed = use_healed,
-        };
-        return self;
-    }
-
-    fn make(step: *Step, prog_node: *std.Progress.Node) anyerror!void {
-        const self = @fieldParentPtr(@This(), "step", step);
-
-        if (self.exercise.skip) {
-            print("Skipping {s}\n\n", .{self.exercise.main_file});
-
-            return;
-        }
-        self.makeInternal(prog_node) catch {
-            if (self.exercise.hint.len > 0) {
-                print("\n{s}HINT: {s}{s}", .{ bold_text, self.exercise.hint, reset_text });
-            }
-
-            print("\n{s}Edit exercises/{s} and run this again.{s}", .{ red_text, self.exercise.main_file, reset_text });
-            print("\n{s}To continue from this zigling, use this command:{s}\n    {s}zig build -Dn={s}{s}\n", .{ red_text, reset_text, bold_text, self.exercise.key(), reset_text });
-            std.os.exit(1);
-        };
-    }
-
-    fn makeInternal(self: *@This(), prog_node: *std.Progress.Node) !void {
-        print("Compiling {s}...\n", .{self.exercise.main_file});
-
-        const exe_file = try self.doCompile(prog_node);
-
-        print("Checking {s}...\n", .{self.exercise.main_file});
-
-        const cwd = self.builder.build_root.path.?;
-
-        const argv = [_][]const u8{exe_file};
-
-        var child = std.ChildProcess.init(&argv, self.builder.allocator);
-
-        child.cwd = cwd;
-        child.env_map = self.builder.env_map;
-
-        child.stdin_behavior = .Inherit;
-        if (self.exercise.check_stdout) {
-            child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Inherit;
-        } else {
-            child.stdout_behavior = .Inherit;
-            child.stderr_behavior = .Pipe;
-        }
-
-        child.spawn() catch |err| {
-            print("{s}Unable to spawn {s}: {s}{s}\n", .{ red_text, argv[0], @errorName(err), reset_text });
-            return err;
-        };
-
-        // Allow up to 1 MB of stdout capture
-        const max_output_len = 1 * 1024 * 1024;
-        const output = if (self.exercise.check_stdout)
-            try child.stdout.?.reader().readAllAlloc(self.builder.allocator, max_output_len)
-        else
-            try child.stderr.?.reader().readAllAlloc(self.builder.allocator, max_output_len);
-
-        // at this point stdout is closed, wait for the process to terminate
-        const term = child.wait() catch |err| {
-            print("{s}Unable to spawn {s}: {s}{s}\n", .{ red_text, argv[0], @errorName(err), reset_text });
-            return err;
-        };
-
-        // make sure it exited cleanly.
-        switch (term) {
-            .Exited => |code| {
-                if (code != 0) {
-                    print("{s}{s} exited with error code {d} (expected {d}){s}\n", .{ red_text, self.exercise.main_file, code, 0, reset_text });
-                    return error.BadExitCode;
-                }
-            },
-            else => {
-                print("{s}{s} terminated unexpectedly{s}\n", .{ red_text, self.exercise.main_file, reset_text });
-                return error.UnexpectedTermination;
-            },
-        }
-
-        // validate the output
-        const trimOutput = std.mem.trimRight(u8, output, " \r\n");
-        const trimExerciseOutput = std.mem.trimRight(u8, self.exercise.output, " \r\n");
-        if (std.mem.indexOf(u8, trimOutput, trimExerciseOutput) == null or trimOutput.len != trimExerciseOutput.len) {
-            print(
-                \\
-                \\{s}----------- Expected this output -----------{s}
-                \\"{s}"
-                \\{s}----------- but found -----------{s}
-                \\"{s}"
-                \\{s}-----------{s}
-                \\
-            , .{ red_text, reset_text, trimExerciseOutput, red_text, reset_text, trimOutput, red_text, reset_text });
-            return error.InvalidOutput;
-        }
-
-        print("{s}PASSED:\n{s}{s}\n", .{ green_text, output, reset_text });
-    }
-
-    // The normal compile step calls os.exit, so we can't use it as a library :(
-    // This is a stripped down copy of std.build.LibExeObjStep.make.
-    fn doCompile(self: *@This(), prog_node: *std.Progress.Node) ![]const u8 {
-        const builder = self.builder;
-
-        var zig_args = std.ArrayList([]const u8).init(builder.allocator);
-        defer zig_args.deinit();
-
-        zig_args.append(builder.zig_exe) catch unreachable;
-        zig_args.append("build-exe") catch unreachable;
-
-        // Enable the stage 1 compiler if using the async feature
-        // disabled because of https://github.com/ratfactor/ziglings/issues/163
-        // if (self.exercise.@"async") {
-        //     zig_args.append("-fstage1") catch unreachable;
-        // }
-
-        // Enable C support for exercises that use C functions
-        if (self.exercise.C) {
-            zig_args.append("-lc") catch unreachable;
-        }
-
-        const zig_file = std.fs.path.join(builder.allocator, &[_][]const u8{ if (self.use_healed) "patches/healed" else "exercises", self.exercise.main_file }) catch unreachable;
-        zig_args.append(builder.pathFromRoot(zig_file)) catch unreachable;
-
-        zig_args.append("--cache-dir") catch unreachable;
-        zig_args.append(builder.pathFromRoot(builder.cache_root.path.?)) catch unreachable;
-
-        zig_args.append("--listen=-") catch unreachable;
-
-        const argv = zig_args.items;
-        var code: u8 = undefined;
-        const file_name = self.eval(argv, &code, prog_node) catch |err| {
-            switch (err) {
-                error.FileNotFound => {
-                    print("{s}{s}: Unable to spawn the following command: file not found{s}\n", .{ red_text, self.exercise.main_file, reset_text });
-                    for (argv) |v| print("{s} ", .{v});
-                    print("\n", .{});
-                },
-                error.ExitCodeFailure => {
-                    print("{s}{s}: The following command exited with error code {}:{s}\n", .{ red_text, self.exercise.main_file, code, reset_text });
-                    for (argv) |v| print("{s} ", .{v});
-                    print("\n", .{});
-                },
-                error.ProcessTerminated => {
-                    print("{s}{s}: The following command terminated unexpectedly:{s}\n", .{ red_text, self.exercise.main_file, reset_text });
-                    for (argv) |v| print("{s} ", .{v});
-                    print("\n", .{});
-                },
-                else => {},
-            }
-
-            return err;
-        };
-
-        return file_name;
-    }
-
-    // Code adapted from `std.Build.execAllowFail and `std.Build.Step.evalZigProcess`.
-    pub fn eval(
-        self: *ZiglingStep,
-        argv: []const []const u8,
-        out_code: *u8,
-        prog_node: *std.Progress.Node,
-    ) ![]const u8 {
-        assert(argv.len != 0);
-        const b = self.step.owner;
-        const allocator = b.allocator;
-
-        var child = Child.init(argv, allocator);
-        child.env_map = b.env_map;
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-
-        try child.spawn();
-
-        var poller = std.io.poll(allocator, enum { stdout, stderr }, .{
-            .stdout = child.stdout.?,
-            .stderr = child.stderr.?,
-        });
-        defer poller.deinit();
-
-        try sendMessage(child.stdin.?, .update);
-        try sendMessage(child.stdin.?, .exit);
-
-        const Header = std.zig.Server.Message.Header;
-        var result: ?[]const u8 = null;
-
-        var node_name: std.ArrayListUnmanaged(u8) = .{};
-        defer node_name.deinit(allocator);
-        var sub_prog_node = prog_node.start("", 0);
-        defer sub_prog_node.end();
-
-        const stdout = poller.fifo(.stdout);
-
-        poll: while (true) {
-            while (stdout.readableLength() < @sizeOf(Header)) {
-                if (!(try poller.poll())) break :poll;
-            }
-            const header = stdout.reader().readStruct(Header) catch unreachable;
-            while (stdout.readableLength() < header.bytes_len) {
-                if (!(try poller.poll())) break :poll;
-            }
-            const body = stdout.readableSliceOfLen(header.bytes_len);
-
-            switch (header.tag) {
-                .zig_version => {
-                    if (!std.mem.eql(u8, builtin.zig_version_string, body))
-                        return error.ZigVersionMismatch;
-                },
-                .error_bundle => {
-                    const EbHdr = std.zig.Server.Message.ErrorBundle;
-                    const eb_hdr = @ptrCast(*align(1) const EbHdr, body);
-                    const extra_bytes =
-                        body[@sizeOf(EbHdr)..][0 .. @sizeOf(u32) * eb_hdr.extra_len];
-                    const string_bytes =
-                        body[@sizeOf(EbHdr) + extra_bytes.len ..][0..eb_hdr.string_bytes_len];
-                    // TODO: use @ptrCast when the compiler supports it
-                    const unaligned_extra = std.mem.bytesAsSlice(u32, extra_bytes);
-                    const extra_array = try allocator.alloc(u32, unaligned_extra.len);
-                    // TODO: use @memcpy when it supports slices
-                    for (extra_array, unaligned_extra) |*dst, src| dst.* = src;
-                    const error_bundle: std.zig.ErrorBundle = .{
-                        .string_bytes = try allocator.dupe(u8, string_bytes),
-                        .extra = extra_array,
-                    };
-
-                    // Print the compiler error bundle now.
-                    // TODO: use the same ttyconf from the builder.
-                    const ttyconf: std.debug.TTY.Config = if (use_color_escapes)
-                        .escape_codes
-                    else
-                        .no_color;
-                    error_bundle.renderToStdErr(
-                        .{ .ttyconf = ttyconf },
-                    );
-                },
-                .progress => {
-                    node_name.clearRetainingCapacity();
-                    try node_name.appendSlice(allocator, body);
-                    sub_prog_node.setName(node_name.items);
-                },
-                .emit_bin_path => {
-                    const EbpHdr = std.zig.Server.Message.EmitBinPath;
-
-                    // TODO: add cache support?
-                    //const ebp_hdr = @ptrCast(*align(1) const EbpHdr, body);
-                    //s.result_cached = ebp_hdr.flags.cache_hit;
-
-                    result = try allocator.dupe(u8, body[@sizeOf(EbpHdr)..]);
-                },
-                else => {}, // ignore other messages
-            }
-
-            stdout.discard(body.len);
-        }
-
-        const stderr = poller.fifo(.stderr);
-        if (stderr.readableLength() > 0) {
-            // Print the additional log and verbose messages now.
-            const messages = try stderr.toOwnedSlice();
-            print("{s}\n", .{messages});
-        }
-
-        // Send EOF to stdin.
-        child.stdin.?.close();
-        child.stdin = null;
-
-        // Keep the errors compatible with std.Build.execAllowFail.
-        const term = try child.wait();
-        switch (term) {
-            .Exited => |code| {
-                if (code != 0) {
-                    out_code.* = @truncate(u8, code);
-
-                    return error.ExitCodeFailure;
-                }
-            },
-            .Signal, .Stopped, .Unknown => |code| {
-                out_code.* = @truncate(u8, code);
-
-                return error.ProcessTerminated;
-            },
-        }
-
-        return result orelse return error.ZigIPCError;
-    }
-};
-
-fn sendMessage(file: std.fs.File, tag: std.zig.Client.Message.Tag) !void {
-    const header: std.zig.Client.Message.Header = .{
-        .tag = tag,
-        .bytes_len = 0,
-    };
-    try file.writeAll(std.mem.asBytes(&header));
-}
-
-// Print a message to stderr.
-const PrintStep = struct {
-    step: Step,
-    message: []const u8,
-
-    pub fn create(owner: *Build, message: []const u8) *PrintStep {
-        const self = owner.allocator.create(PrintStep) catch @panic("OOM");
-        self.* = .{
-            .step = Step.init(.{
-                .id = .custom,
-                .name = "print",
-                .owner = owner,
-                .makeFn = make,
-            }),
-            .message = message,
-        };
-
-        return self;
-    }
-
-    fn make(step: *Step, prog_node: *std.Progress.Node) !void {
-        _ = prog_node;
-        const p = @fieldParentPtr(PrintStep, "step", step);
-
-        print("{s}", .{p.message});
-    }
-};
-
-// Skip an exercise.
-const SkipStep = struct {
-    step: Step,
-    exercise: Exercise,
-
-    pub fn create(owner: *Build, exercise: Exercise) *SkipStep {
-        const self = owner.allocator.create(SkipStep) catch @panic("OOM");
-        self.* = .{
-            .step = Step.init(.{
-                .id = .custom,
-                .name = owner.fmt("skip {s}", .{exercise.main_file}),
-                .owner = owner,
-                .makeFn = make,
-            }),
-            .exercise = exercise,
-        };
-
-        return self;
-    }
-
-    fn make(step: *Step, prog_node: *std.Progress.Node) !void {
-        _ = prog_node;
-        const p = @fieldParentPtr(SkipStep, "step", step);
-
-        if (p.exercise.skip) {
-            print("{s} skipped\n", .{p.exercise.main_file});
-        }
-    }
-};
-
-// Check that each exercise number, excluding the last, forms the sequence `[1, exercise.len)`.
-fn validate_exercises() bool {
-    // Don't use the "multi-object for loop" syntax, in order to avoid a syntax error with old Zig
-    // compilers.
-    var i: usize = 0;
-    for (exercises[0 .. exercises.len - 1]) |ex| {
-        i += 1;
-        if (ex.number() != i) {
-            print(
-                "exercise {s} has an incorrect number: expected {}, got {s}\n",
-                .{ ex.main_file, i, ex.key() },
-            );
-
-            return false;
-        }
-    }
-
-    return true;
-}
